@@ -7,6 +7,7 @@ import {
   Cache,
   DistributedLock,
   getTimeTakenSincePoint,
+  makeRequest,
   Time,
 } from '../utils/index.js';
 import { StremThruService } from './stremthru.js';
@@ -25,6 +26,8 @@ import {
   DebridFailureCache,
 } from './base.js';
 import { ParsedResult, parseTorrentTitle } from '@viren070/parse-torrent-title';
+import { File } from 'node:buffer';
+import { FormData } from 'undici';
 
 const logger = createLogger('debrid:torbox');
 
@@ -285,13 +288,61 @@ export class TorboxDebridService
 
   public async addNzb(nzb: string, name: string): Promise<DebridDownload> {
     try {
-      const res = await this.torboxApi.usenet.createUsenetDownload(
-        this.apiVersion,
+      const nzbResponse = await makeRequest(nzb, {
+        method: 'GET',
+        timeout: Env.DEFAULT_TIMEOUT,
+      });
+
+      if (!nzbResponse.ok) {
+        throw new DebridError(`Failed to fetch NZB: ${nzbResponse.statusText}`, {
+          statusCode: nzbResponse.status,
+          statusText: nzbResponse.statusText,
+          code: 'BAD_GATEWAY',
+          headers: Object.fromEntries(nzbResponse.headers.entries()),
+          body: await nzbResponse.text(),
+          type: 'upstream_error',
+        });
+      }
+
+      const nzbBytes = await nzbResponse.arrayBuffer();
+      const form = new FormData();
+      const filename = `${name || 'download'}.nzb`.replace(/[\\/]/g, '_');
+      form.append(
+        'file',
+        new File([new Uint8Array(nzbBytes)], filename, {
+          type: 'application/x-nzb',
+        })
+      );
+      form.append('name', name);
+
+      logger.debug(`Uploading fetched NZB to TorBox`, {
+        name,
+        bytes: nzbBytes.byteLength,
+      });
+
+      const response = await makeRequest(
+        `https://api.torbox.app/${this.apiVersion}/api/usenet/createusenetdownload`,
         {
-          link: nzb,
-          name,
+          method: 'POST',
+          timeout: Env.DEFAULT_TIMEOUT,
+          headers: {
+            Authorization: `Bearer ${this.config.token}`,
+          },
+          body: form,
         }
       );
+
+      const res = {
+        data: (await response.json()) as {
+          data?: { usenetdownloadId?: string | number };
+          detail?: string;
+        },
+        metadata: {
+          status: response.status,
+          statusText: response.statusText,
+          headers: Object.fromEntries(response.headers.entries()),
+        },
+      };
 
       if (!res.data?.data?.usenetdownloadId) {
         throw new DebridError(`Usenet download failed: ${res.data?.detail}`, {
